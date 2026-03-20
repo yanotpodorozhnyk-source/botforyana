@@ -1,108 +1,349 @@
 import logging
 import re
-import hashlib
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
-import gspread
 import os
 import base64
 import json
 
-# --- Decode Google Sheets credentials ---
-credentials_b64 = os.getenv('GOOGLE_CREDENTIALS')
-if credentials_b64:
-    credentials_json = base64.b64decode(credentials_b64).decode('utf-8')
-    credentials_dict = json.loads(credentials_json)
-    with open('credentials.json', 'w') as f:
-        json.dump(credentials_dict, f)
-# --- Логування ---
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ContextTypes,
+    filters
 )
 
-# --- Google Sheets ---
-gc = gspread.service_account(filename='credentials.json')
-sheet = gc.open('База знань').sheet1
-data = sheet.get_all_records()
+import gspread
+from google.oauth2.service_account import Credentials
 
-# --- Створюємо дерево меню ---
-tree = {}
-for row in data:
-    cat = row['Категорія'].strip()
-    sub = row['Підтема'].strip()
-    q = row['Питання'].strip()
-    ans = row.get('Відповідь', '').strip()
-    
-    if cat not in tree:
-        tree[cat] = {}
-    if sub not in tree[cat]:
-        tree[cat][sub] = {}
-    tree[cat][sub][q] = ans
+logging.basicConfig(level=logging.INFO)
 
-# --- Безпечний callback ---
-def safe_callback(text):
-    clean = re.sub(r'\s+', '_', text.strip())
-    clean = re.sub(r'[^a-zA-Z0-9_]', '', clean)
-    h = hashlib.sha1(text.encode('utf-8')).hexdigest()[:20]
-    return f"{clean}_{h}"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# --- Старт ---
+# --- Google credentials ---
+credentials_b64 = os.getenv("GOOGLE_CREDENTIALS")
+credentials_json = base64.b64decode(credentials_b64).decode("utf-8")
+creds_dict = json.loads(credentials_json)
+
+scope = [
+    "https://spreadsheets.google.com/feeds",
+    "https://www.googleapis.com/auth/drive"
+]
+
+creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
+client = gspread.authorize(creds)
+
+SPREADSHEET_ID = "197_It5B9M2d5pX2m3igzrQGF3snHs9mzOzPuAQ_SUjU"
+
+sheet = client.open_by_key(SPREADSHEET_ID)
+
+pharmacy_sheet = sheet.worksheet("Аптеки учасники оновлено 18.11")
+program_sheet = sheet.worksheet("Умови соц.проограм")
+
+# --- STATES ---
+WAIT_DRUG = {}
+WAIT_PROGRAM = {}
+WAIT_PHARMACY_NUMBER = {}
+WAIT_PHARMACY_ADDRESS = {}
+
+# --- UTIL FUNCTIONS ---
+
+def normalize(text):
+    if not text:
+        return ""
+    return text.lower().strip()
+
+
+def is_pharmacy_connected(value):
+    if not value:
+        return False
+
+    value = value.lower()
+
+    if "відключено" in value:
+        return False
+
+    return True
+
+
+# --- LOAD PHARMACIES ---
+
+def load_pharmacies():
+
+    rows = pharmacy_sheet.get_all_records()
+
+    pharmacies = []
+
+    for r in rows:
+
+        pharmacy = {
+            "number": r.get("Короткий номер", ""),
+            "city": r.get("Місто", ""),
+            "street": r.get("Вулиця", ""),
+            "region": r.get("Область", ""),
+            "phone": r.get("Телефон", ""),
+            "programs": {}
+        }
+
+        for key in r:
+            if key not in [
+                "Короткий номер",
+                "Місто",
+                "Вулиця",
+                "Область",
+                "Телефон"
+            ]:
+
+                if is_pharmacy_connected(r[key]):
+                    pharmacy["programs"][key] = True
+
+        pharmacies.append(pharmacy)
+
+    return pharmacies
+
+
+# --- LOAD PROGRAMS ---
+
+def load_programs():
+
+    rows = program_sheet.get_all_values()
+
+    programs = {}
+    current_program = None
+
+    for r in rows:
+
+        if "Програма" in r[0]:
+
+            current_program = r[1].strip()
+            programs[current_program] = []
+
+            continue
+
+        if current_program and r[2]:
+
+            drug = r[2]
+
+            if "виключ" in drug.lower():
+                continue
+
+            programs[current_program].append({
+                "limit": r[1],
+                "drug": drug,
+                "discount": r[3]
+            })
+
+    return programs
+
+
+PHARMACIES = load_pharmacies()
+PROGRAMS = load_programs()
+
+# --- SEARCH DRUG ---
+
+def search_drug(name):
+
+    results = []
+
+    name = normalize(name)
+
+    for program in PROGRAMS:
+
+        for drug in PROGRAMS[program]:
+
+            if name in normalize(drug["drug"]):
+
+                results.append(
+                    f"💳 {program}\n"
+                    f"{drug['drug']}\n"
+                    f"Знижка: {drug['discount']}\n"
+                    f"Ліміт: {drug['limit']}\n"
+                )
+
+    return results
+
+
+# --- SEARCH PROGRAM PHARMACIES ---
+
+def pharmacies_by_program(program):
+
+    result = []
+
+    for p in PHARMACIES:
+
+        if program in p["programs"]:
+
+            result.append(
+                f"🏥 {p['number']}\n"
+                f"{p['region']} {p['city']}\n"
+                f"{p['street']}\n"
+                f"{p['phone']}"
+            )
+
+    return result
+
+
+# --- SEARCH BY NUMBER ---
+
+def pharmacy_by_number(num):
+
+    result = []
+
+    for p in PHARMACIES:
+
+        if str(p["number"]).startswith(num):
+
+            result.append(
+                f"🏥 {p['number']}\n"
+                f"{p['region']} {p['city']}\n"
+                f"{p['street']}\n"
+                f"{p['phone']}"
+            )
+
+    return result
+
+
+# --- SEARCH BY ADDRESS ---
+
+def pharmacy_by_address(text):
+
+    text = normalize(text)
+
+    result = []
+
+    for p in PHARMACIES:
+
+        addr = f"{p['city']} {p['street']}"
+
+        if text in normalize(addr):
+
+            result.append(
+                f"🏥 {p['number']}\n"
+                f"{p['region']} {p['city']}\n"
+                f"{p['street']}\n"
+                f"{p['phone']}"
+            )
+
+    return result
+
+
+# --- START ---
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [[InlineKeyboardButton(cat, callback_data=safe_callback(cat))] for cat in tree]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("Привіт! Обери категорію:", reply_markup=reply_markup)
 
-# --- Обробка кнопок ---
+    keyboard = [
+        [InlineKeyboardButton("💳 Карткові соц програми", callback_data="social_programs")]
+    ]
+
+    await update.message.reply_text(
+        "Оберіть розділ:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+# --- BUTTON HANDLER ---
+
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
     query = update.callback_query
     await query.answer()
-    data_cb = query.data
 
-    # --- Категорія ---
-    for cat in tree:
-        if safe_callback(cat) == data_cb:
-            keyboard = [[InlineKeyboardButton(sub, callback_data=safe_callback(f"{cat}|{sub}"))] for sub in tree[cat]]
-            keyboard.append([InlineKeyboardButton("Головне меню", callback_data="main_menu")])
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await query.edit_message_text(f"Категорія: {cat}\nОберіть підтему:", reply_markup=reply_markup)
-            return
+    data = query.data
 
-    # --- Підтема ---
-    for cat in tree:
-        for sub in tree[cat]:
-            if safe_callback(f"{cat}|{sub}") == data_cb:
-                keyboard = [[InlineKeyboardButton(q, callback_data=safe_callback(f"{cat}|{sub}|{q}"))] for q in tree[cat][sub]]
-                keyboard.append([InlineKeyboardButton("Назад", callback_data=safe_callback(cat))])
-                keyboard.append([InlineKeyboardButton("Головне меню", callback_data="main_menu")])
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                await query.edit_message_text(f"Підтема: {sub}\nОберіть питання:", reply_markup=reply_markup)
-                return
+    if data == "social_programs":
 
-    # --- Питання ---
-    for cat in tree:
-        for sub in tree[cat]:
-            for q, ans in tree[cat][sub].items():
-                if safe_callback(f"{cat}|{sub}|{q}") == data_cb:
-                    keyboard = [
-                        [InlineKeyboardButton("Назад", callback_data=safe_callback(f"{cat}|{sub}"))],
-                        [InlineKeyboardButton("Головне меню", callback_data="main_menu")]
-                    ]
-                    reply_markup = InlineKeyboardMarkup(keyboard)
-                    await query.edit_message_text(ans, reply_markup=reply_markup)
-                    return
+        keyboard = [
+            [InlineKeyboardButton("🔎 Пошук препарату", callback_data="drug")],
+            [InlineKeyboardButton("💳 Пошук програми", callback_data="program")],
+            [InlineKeyboardButton("🏥 Аптека по номеру", callback_data="number")],
+            [InlineKeyboardButton("📍 Аптека по адресі", callback_data="address")]
+        ]
 
-    # --- Головне меню ---
-    if data_cb == "main_menu":
-        keyboard = [[InlineKeyboardButton(cat, callback_data=safe_callback(cat))] for cat in tree]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text("Привіт! Обери категорію:", reply_markup=reply_markup)
+        await query.edit_message_text(
+            "Оберіть варіант:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
 
-# --- Запуск ---
-if __name__ == '__main__':
-    TOKEN = os.getenv('TELEGRAM_TOKEN')
-    app = ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(CommandHandler('start', start))
-    app.add_handler(CallbackQueryHandler(button_handler))
-    print("Бот запущений...")
-    app.run_polling()
+    elif data == "drug":
+
+        WAIT_DRUG[query.from_user.id] = True
+        await query.message.reply_text("Введіть назву препарату")
+
+    elif data == "program":
+
+        WAIT_PROGRAM[query.from_user.id] = True
+        await query.message.reply_text("Введіть назву програми")
+
+    elif data == "number":
+
+        WAIT_PHARMACY_NUMBER[query.from_user.id] = True
+        await query.message.reply_text("Введіть номер аптеки")
+
+    elif data == "address":
+
+        WAIT_PHARMACY_ADDRESS[query.from_user.id] = True
+        await query.message.reply_text("Введіть місто або вулицю")
+
+
+# --- TEXT HANDLER ---
+
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    uid = update.message.from_user.id
+    text = update.message.text
+
+    if uid in WAIT_DRUG:
+
+        WAIT_DRUG.pop(uid)
+
+        res = search_drug(text)
+
+        if res:
+            await update.message.reply_text("\n\n".join(res[:10]))
+        else:
+            await update.message.reply_text("Нічого не знайдено")
+
+    elif uid in WAIT_PROGRAM:
+
+        WAIT_PROGRAM.pop(uid)
+
+        res = pharmacies_by_program(text)
+
+        if res:
+            await update.message.reply_text("\n\n".join(res[:20]))
+        else:
+            await update.message.reply_text("Аптек не знайдено")
+
+    elif uid in WAIT_PHARMACY_NUMBER:
+
+        WAIT_PHARMACY_NUMBER.pop(uid)
+
+        res = pharmacy_by_number(text)
+
+        if res:
+            await update.message.reply_text("\n\n".join(res))
+        else:
+            await update.message.reply_text("Аптеку не знайдено")
+
+    elif uid in WAIT_PHARMACY_ADDRESS:
+
+        WAIT_PHARMACY_ADDRESS.pop(uid)
+
+        res = pharmacy_by_address(text)
+
+        if res:
+            await update.message.reply_text("\n\n".join(res))
+        else:
+            await update.message.reply_text("Аптеку не знайдено")
+
+
+# --- MAIN ---
+
+app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+app.add_handler(CommandHandler("start", start))
+app.add_handler(CallbackQueryHandler(button_handler))
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+
+app.run_polling()
