@@ -1,108 +1,243 @@
 import logging
-import re
 import hashlib
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
 import gspread
-import os
-import base64
-import json
 
-# --- Decode Google Sheets credentials ---
-credentials_b64 = os.getenv('GOOGLE_CREDENTIALS')
-if credentials_b64:
-    credentials_json = base64.b64decode(credentials_b64).decode('utf-8')
-    credentials_dict = json.loads(credentials_json)
-    with open('credentials.json', 'w') as f:
-        json.dump(credentials_dict, f)
-# --- Логування ---
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+from google.oauth2.service_account import Credentials
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ContextTypes,
+    filters
 )
 
-# --- Google Sheets ---
-gc = gspread.service_account(filename='credentials.json')
-sheet = gc.open('База знань').sheet1
+# ---------------- LOGGING ----------------
+logging.basicConfig(level=logging.INFO)
+
+TOKEN = "ТУТ_ТВІЙ_ТОКЕН"
+
+# ---------------- GOOGLE SHEETS ----------------
+scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+
+creds = Credentials.from_service_account_file(
+    "credentials.json",
+    scopes=scopes
+)
+
+gc = gspread.authorize(creds)
+
+sheet = gc.open("База знань").sheet1
 data = sheet.get_all_records()
 
-# --- Створюємо дерево меню ---
+print(f"📚 Завантажено записів: {len(data)}")
+
+# ---------------- TREE ----------------
 tree = {}
+answers = {}
+
 for row in data:
-    cat = row['Категорія'].strip()
-    sub = row['Підтема'].strip()
-    q = row['Питання'].strip()
-    ans = row.get('Відповідь', '').strip()
-    
+    cat = row["Категорія"]
+    sub = row["Підтема"]
+    q = row["Питання"]
+    ans = row["Відповідь"]
+
     if cat not in tree:
         tree[cat] = {}
+
     if sub not in tree[cat]:
-        tree[cat][sub] = {}
-    tree[cat][sub][q] = ans
+        tree[cat][sub] = []
 
-# --- Безпечний callback ---
+    tree[cat][sub].append(q)
+    answers[f"{cat}|{sub}|{q}"] = ans
+
+
+# ---------------- CALLBACK SAFE ----------------
+callback_map = {}
+
 def safe_callback(text):
-    clean = re.sub(r'\s+', '_', text.strip())
-    clean = re.sub(r'[^a-zA-Z0-9_]', '', clean)
-    h = hashlib.sha1(text.encode('utf-8')).hexdigest()[:20]
-    return f"{clean}_{h}"
+    key = hashlib.md5(text.encode()).hexdigest()[:10]
+    callback_map[key] = text
+    return key
 
-# --- Старт ---
+
+# ---------------- START ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [[InlineKeyboardButton(cat, callback_data=safe_callback(cat))] for cat in tree]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("Привіт! Обери категорію:", reply_markup=reply_markup)
 
-# --- Обробка кнопок ---
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = []
+
+    for cat in tree:
+        keyboard.append(
+            [InlineKeyboardButton(cat, callback_data=safe_callback(cat))]
+        )
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_text(
+        "Оберіть категорію:",
+        reply_markup=reply_markup
+    )
+
+
+# ---------------- SEARCH START ----------------
+async def check_apteka_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
     query = update.callback_query
     await query.answer()
+
+    context.user_data["search_apteka"] = True
+
+    await query.edit_message_text(
+        "Введіть номер аптеки:"
+    )
+
+
+# ---------------- MESSAGE SEARCH ----------------
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    if not context.user_data.get("search_apteka"):
+        return
+
+    apteka = update.message.text
+
+    context.user_data["search_apteka"] = False
+
+    keyboard = [
+        [InlineKeyboardButton("Головне меню", callback_data="main_menu")]
+    ]
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_text(
+        f"🔎 Пошук аптеки: {apteka}\n\n(тут буде перевірка підключення)",
+        reply_markup=reply_markup
+    )
+
+
+# ---------------- MENU HANDLER ----------------
+async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    query = update.callback_query
+    await query.answer()
+
     data_cb = query.data
 
-    # --- Категорія ---
-    for cat in tree:
-        if safe_callback(cat) == data_cb:
-            keyboard = [[InlineKeyboardButton(sub, callback_data=safe_callback(f"{cat}|{sub}"))] for sub in tree[cat]]
-            keyboard.append([InlineKeyboardButton("Головне меню", callback_data="main_menu")])
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await query.edit_message_text(f"Категорія: {cat}\nОберіть підтему:", reply_markup=reply_markup)
+    if data_cb == "main_menu":
+
+        keyboard = []
+
+        for cat in tree:
+            keyboard.append(
+                [InlineKeyboardButton(cat, callback_data=safe_callback(cat))]
+            )
+
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await query.edit_message_text(
+            "Оберіть категорію:",
+            reply_markup=reply_markup
+        )
+        return
+
+    if data_cb not in callback_map:
+        return
+
+    data = callback_map[data_cb]
+
+    parts = data.split("|")
+
+    # ---------------- CATEGORY ----------------
+    if len(parts) == 1:
+
+        cat = parts[0]
+
+        keyboard = [
+            [InlineKeyboardButton(sub, callback_data=safe_callback(f"{cat}|{sub}"))]
+            for sub in tree[cat]
+        ]
+
+        keyboard.append(
+            [InlineKeyboardButton("Головне меню", callback_data="main_menu")]
+        )
+
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await query.edit_message_text(
+            f"Категорія: {cat}",
+            reply_markup=reply_markup
+        )
+        return
+
+
+    # ---------------- SUBCATEGORY ----------------
+    if len(parts) == 2:
+
+        cat, sub = parts
+
+        # ⭐ СПЕЦІАЛЬНА КНОПКА ПОШУКУ
+        if "підключена аптека" in sub.lower():
+
+            await check_apteka_start(update, context)
             return
 
-    # --- Підтема ---
-    for cat in tree:
-        for sub in tree[cat]:
-            if safe_callback(f"{cat}|{sub}") == data_cb:
-                keyboard = [[InlineKeyboardButton(q, callback_data=safe_callback(f"{cat}|{sub}|{q}"))] for q in tree[cat][sub]]
-                keyboard.append([InlineKeyboardButton("Назад", callback_data=safe_callback(cat))])
-                keyboard.append([InlineKeyboardButton("Головне меню", callback_data="main_menu")])
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                await query.edit_message_text(f"Підтема: {sub}\nОберіть питання:", reply_markup=reply_markup)
-                return
+        keyboard = [
+            [InlineKeyboardButton(q, callback_data=safe_callback(f"{cat}|{sub}|{q}"))]
+            for q in tree[cat][sub]
+        ]
 
-    # --- Питання ---
-    for cat in tree:
-        for sub in tree[cat]:
-            for q, ans in tree[cat][sub].items():
-                if safe_callback(f"{cat}|{sub}|{q}") == data_cb:
-                    keyboard = [
-                        [InlineKeyboardButton("Назад", callback_data=safe_callback(f"{cat}|{sub}"))],
-                        [InlineKeyboardButton("Головне меню", callback_data="main_menu")]
-                    ]
-                    reply_markup = InlineKeyboardMarkup(keyboard)
-                    await query.edit_message_text(ans, reply_markup=reply_markup)
-                    return
+        keyboard.append(
+            [InlineKeyboardButton("Назад", callback_data=safe_callback(cat))]
+        )
 
-    # --- Головне меню ---
-    if data_cb == "main_menu":
-        keyboard = [[InlineKeyboardButton(cat, callback_data=safe_callback(cat))] for cat in tree]
+        keyboard.append(
+            [InlineKeyboardButton("Головне меню", callback_data="main_menu")]
+        )
+
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text("Привіт! Обери категорію:", reply_markup=reply_markup)
 
-# --- Запуск ---
-if __name__ == '__main__':
-    TOKEN = os.getenv('TELEGRAM_TOKEN')
+        await query.edit_message_text(
+            f"Підтема: {sub}\nОберіть питання:",
+            reply_markup=reply_markup
+        )
+        return
+
+
+    # ---------------- ANSWER ----------------
+    if len(parts) == 3:
+
+        cat, sub, q = parts
+
+        ans = answers.get(data, "Інформація відсутня")
+
+        keyboard = [
+            [InlineKeyboardButton("Назад", callback_data=safe_callback(f"{cat}|{sub}"))],
+            [InlineKeyboardButton("Головне меню", callback_data="main_menu")]
+        ]
+
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await query.edit_message_text(
+            ans if ans else "Інформація відсутня",
+            reply_markup=reply_markup
+        )
+
+
+# ---------------- MAIN ----------------
+def main():
+
     app = ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(CommandHandler('start', start))
-    app.add_handler(CallbackQueryHandler(button_handler))
-    print("Бот запущений...")
+
+    app.add_handler(CommandHandler("start", start))
+
+    app.add_handler(CallbackQueryHandler(button))
+
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+
+    print("🚀 Bot started")
+
     app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
